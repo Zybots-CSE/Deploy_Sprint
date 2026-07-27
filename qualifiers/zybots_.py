@@ -1,202 +1,496 @@
-"""
-Titan German Whist Player Bot (Fixed & Optimized)
-
-Strategy Architecture:
-- Phase 1 (Recruitment): Card counting pool tracking. Dynamically evaluates 
-  prizes (Trumps/Aces/Kings) and manages suit length.
-- Phase 2 (Scoring): Exact Opponent Hand Deduction + Master-Card Calculation.
-  Plays provable guaranteed winners (Boss Cards) and minimal cost follow-cards.
-"""
-
-SUITS = ["H", "D", "C", "S"]
-RANKS = list(range(2, 15))
-FULL_DECK = set((s, r) for s in SUITS for r in RANKS)
-
-
-def legal_cards(hand, lead_card):
-    """Return legally playable cards in accordance with follow-suit rules."""
-    if lead_card is None:
-        return list(hand)
-    lead_suit = lead_card[0]
-    same_suit = [c for c in hand if c[0] == lead_suit]
-    return same_suit if same_suit else list(hand)
-
-
-def resolve_trick(lead_card, follow_card, trump_suit):
-    """Returns True if lead_card wins, False if follow_card wins."""
-    lead_suit, lead_rank = lead_card
-    follow_suit, follow_rank = follow_card
-
-    if follow_suit == lead_suit:
-        return lead_rank >= follow_rank
-    elif follow_suit == trump_suit:
-        return False
-    return True
-
+import random
+import time
 
 # ---------------------------------------------------------------------------
-# Persistent Match Memory (Safely auto-resets on every new game)
+# Constants & Evaluation Parameters
 # ---------------------------------------------------------------------------
-class BotMemory:
-    def __init__(self):
-        self.seen_cards = set()
+SUITS = ("H", "D", "C", "S")
+DECK = frozenset((s, r) for s in SUITS for r in range(2, 15))
 
-    def sync(self, view):
-        # Auto-reset state when a new game starts (13 cards in hand, stock 25)
-        if view.phase == 1 and view.stock_remaining == 25 and len(view.your_hand) == 13:
-            self.seen_cards.clear()
+NONTRUMP_V = {
+    2: 0.5, 3: 1.0, 4: 2.0, 5: 3.0, 6: 4.0, 7: 5.0, 8: 7.0, 9: 9.0,
+    10: 13.0, 11: 19.0, 12: 30.0, 13: 47.0, 14: 72.0
+}
+TRUMP_V = {
+    2: 40.0, 3: 42.0, 4: 44.0, 5: 46.0, 6: 49.0, 7: 52.0, 8: 56.0,
+    9: 61.0, 10: 67.0, 11: 74.0, 12: 84.0, 13: 95.0, 14: 106.0
+}
 
-        # Track all witnessed cards
-        for card in view.your_hand:
-            self.seen_cards.add(card)
-        if view.face_up_card:
-            self.seen_cards.add(view.face_up_card)
-        for _, card in view.current_trick:
-            self.seen_cards.add(card)
+TR_PREMIUM = 10.0
+VOID_REFILL = 10.0
+NEAR_VOID_PEN = 5.0
+LEN_BONUS = 4.0
+DUMP_LEN_W = 3.0
+GUARD_K = 15.0
+GUARD_Q = 5.0
+TRUMP_CLING = 65.0
+MASTER_KEEP = 55.0
+EXIT_VOID_W = 7.0
+RISK_MAX = 0.15
+PT_DEAD = 0.08
 
-    def deduce_opponent_hand(self, your_hand):
-        """In Phase 2, unseen cards are 100% in opponent's hand."""
-        unseen = FULL_DECK - self.seen_cards - set(your_hand)
-        return list(unseen)
+P1_LEAD_MARGIN = 0.8
+P1_FOLLOW_MARGIN = 0.4
 
+N_PARTICLES = 200
+MIN_PARTICLES = 50
+BEHAVE_EPS = 0.20
 
-MEMORY = BotMemory()
+EG_HAND = 10        # Deep search into Phase 2
+EG_SAMPLES = 12
+EG_TIME = 0.035
 
+_S = {}
 
 # ---------------------------------------------------------------------------
-# Phase 2 Decision Engine (Master Card & Exact Deduction)
+# Helpers
 # ---------------------------------------------------------------------------
-def solve_phase2_move(hand, opp_hand, trump, lead_card):
-    allowed = legal_cards(hand, lead_card)
+def _v(card, trump):
+    return TRUMP_V[card[1]] if card[0] == trump else NONTRUMP_V[card[1]]
 
-    def card_power(c):
-        return (20 if c[0] == trump else 0) + c[1]
+def _beats(lead_card, follow_card, trump):
+    ls, lr = lead_card
+    fs, fr = follow_card
+    if fs == ls:
+        return fr > lr
+    return fs == trump
 
-    allowed_sorted = sorted(allowed, key=card_power)
+def _trick_id(view):
+    if view.phase == 1:
+        return (25 - view.stock_remaining) // 2 + 1
+    return 14 + sum(view.tricks_won.values())
 
-    # 1. LEADING (We play first)
-    if lead_card is None:
-        # Find "Boss / Master Cards" (Cards that no card left in opp_hand can beat)
-        boss_cards = []
-        for card in hand:
-            c_suit, c_rank = card
-            # Opponent cards in the same suit that beat this card
-            opp_higher = [
-                oc for oc in opp_hand 
-                if oc[0] == c_suit and oc[1] > c_rank
-            ]
-            
-            if not opp_higher:
-                if c_suit == trump:
-                    boss_cards.append(card)
-                else:
-                    # Non-trump boss card is guaranteed win if opponent has no trumps or must follow suit
-                    opp_has_trumps = any(oc[0] == trump for oc in opp_hand)
-                    opp_has_suit = any(oc[0] == c_suit for oc in opp_hand)
-                    if not opp_has_trumps or opp_has_suit:
-                        boss_cards.append(card)
+def _opp_size(view):
+    if view.phase == 1:
+        return 13 if not view.current_trick else 12
+    n = len(view.your_hand)
+    return n if not view.current_trick else n - 1
 
-        if boss_cards:
-            # Cash in boss cards starting with non-trumps
-            non_trump_bosses = [c for c in boss_cards if c[0] != trump]
-            if non_trump_bosses:
-                return max(non_trump_bosses, key=lambda c: c[1])
-            return max(boss_cards, key=lambda c: c[1])
+def _unseen():
+    return DECK - _S["ever_mine"] - _S["faceups"] - _S["opp_led"] - _S["opp_known"]
 
-        # If no guaranteed boss card, lead lowest card from our shortest non-trump suit
-        non_trumps = [c for c in allowed_sorted if c[0] != trump]
-        if non_trumps:
-            suit_counts = {}
-            for c in non_trumps:
-                suit_counts[c[0]] = suit_counts.get(c[0], 0) + 1
-            shortest_suit = min(suit_counts, key=suit_counts.get)
-            shortest_candidates = [c for c in non_trumps if c[0] == shortest_suit]
-            return shortest_candidates[0]
+# ---------------------------------------------------------------------------
+# Particle Filter with Hard Constraints on Known Opponent Cards
+# ---------------------------------------------------------------------------
+def _reset(view):
+    _S.clear()
+    _S["me"] = view.your_name
+    _S["ever_mine"] = set(view.your_hand)
+    _S["faceups"] = set()
+    _S["opp_led"] = set()
+    _S["opp_known"] = set()  # Hard-locked cards opponent is known to hold
+    _S["pending"] = None
+    if view.face_up_card is not None:
+        _S["faceups"].add(view.face_up_card)
 
-        return allowed_sorted[0]
+    pool = list(_unseen())
+    parts = []
+    need = 12 if view.current_trick else 13
+    
+    if view.current_trick:
+        lead = view.current_trick[0][1]
+        _S["opp_led"].add(lead)
 
-    # 2. FOLLOWING (Opponent played lead_card)
+    for _ in range(N_PARTICLES):
+        p = set(_S["opp_known"])
+        rem_size = need - len(p)
+        if rem_size > 0 and len(pool) >= rem_size:
+            p.update(random.sample(pool, rem_size))
+        parts.append(p)
+    _S["particles"] = parts
+
+def _enforce_known(p, target_size):
+    """Ensure locked known cards remain in particle p."""
+    p.update(_S["opp_known"])
+    while len(p) > target_size:
+        removable = [c for c in p if c not in _S["opp_known"]]
+        if not removable:
+            break
+        p.discard(random.choice(removable))
+
+def _cull(card):
+    _S["opp_known"].discard(card)
+    unseen_pool = list(_unseen())
+    for p in _S["particles"]:
+        if card in p:
+            p.discard(card)
+            cand = [c for c in unseen_pool if c not in p]
+            if cand:
+                p.add(random.choice(cand))
+
+def _opp_lead_event(card, view=None):
+    _S["opp_led"].add(card)
+    _S["opp_known"].discard(card)
+    for p in _S["particles"]:
+        p.discard(card)
+
+def _opp_follow_event(our_lead, they_won, trump):
+    ls, lr = our_lead
+    unseen_pool = list(_unseen())
+
+    out = []
+    for p in _S["particles"]:
+        same = [c for c in p if c[0] == ls]
+        legal = same if same else list(p)
+        cons = [c for c in legal if _beats(our_lead, c, trump) == they_won]
+
+        if cons:
+            played = min(cons, key=lambda c: _v(c, trump)) if random.random() >= BEHAVE_EPS else random.choice(cons)
+            p.discard(played)
+            _S["opp_known"].discard(played)
+        else:
+            # Repair particle while retaining opp_known
+            size_after = len(p) - 1
+            removable = [c for c in p if c not in _S["opp_known"]]
+            if removable:
+                p.discard(random.choice(removable))
+            p.update(_S["opp_known"])
+            cand = [c for c in unseen_pool if c not in p]
+            while len(p) < size_after and cand:
+                c = random.choice(cand)
+                p.add(c)
+                cand.remove(c)
+        out.append(p)
+    _S["particles"] = out
+
+def _opp_gain_faceup(card):
+    _S["opp_known"].add(card)
+    for p in _S["particles"]:
+        p.add(card)
+
+def _opp_gain_hidden():
+    pool = list(_unseen())
+    if not pool:
+        return
+    for p in _S["particles"]:
+        cand = [c for c in pool if c not in p]
+        if cand:
+            p.add(random.choice(cand))
+
+def _repopulate(size):
+    parts = _S["particles"]
+    parts = [p for p in parts if len(p) == size]
+    unseen_pool = list(_unseen())
+
+    while len(parts) < N_PARTICLES:
+        p = set(_S["opp_known"])
+        rem_size = size - len(p)
+        if rem_size > 0 and len(unseen_pool) >= rem_size:
+            p.update(random.sample(unseen_pool, rem_size))
+        parts.append(p)
+    _S["particles"] = parts
+
+def _update(view):
+    if view.phase == 1 and view.stock_remaining == 25 and len(view.your_hand) == 13:
+        _reset(view)
+        return _trick_id(view)
+    if not _S or "particles" not in _S:
+        _reset(view)
+
+    new_mine = set(view.your_hand) - _S["ever_mine"]
+    _S["ever_mine"].update(new_mine)
+    for c in new_mine:
+        _cull(c)
+
+    fu = view.face_up_card
+    if fu is not None and fu not in _S["faceups"]:
+        _S["faceups"].add(fu)
+        _cull(fu)
+
+    tid = _trick_id(view)
+
+    pend = _S["pending"]
+    if pend is not None and pend[0] < tid:
+        ptid, pcard, pfu, pphase = pend
+        we_won = (view.lead == view.your_name)
+        _opp_follow_event(pcard, not we_won, view.trump_suit)
+        if pphase == 1:
+            if we_won:
+                _opp_gain_hidden()
+            elif pfu is not None:
+                _opp_gain_faceup(pfu)
+        _S["pending"] = None
+
+    if view.current_trick:
+        _opp_lead_event(view.current_trick[0][1], view)
+
+    size = _opp_size(view)
+    _repopulate(size)
+    return tid
+
+def _after_move(view, card, tid):
+    if view.current_trick:
+        lead_card = view.current_trick[0][1]
+        we_win = _beats(lead_card, card, view.trump_suit)
+        if view.phase == 1:
+            if we_win:
+                _opp_gain_hidden()
+            elif view.face_up_card is not None:
+                _opp_gain_faceup(view.face_up_card)
+            _S["pending"] = None
     else:
-        lead_suit = lead_card[0]
-        can_follow = (allowed[0][0] == lead_suit)
-
-        if can_follow:
-            # Find all legal cards that beat opponent's card
-            winners = [c for c in allowed_sorted if c[1] > lead_card[1]]
-            if winners:
-                return winners[0]  # Play smallest winning card
-            return allowed_sorted[0]  # Can't win -> discard lowest card
-
-        # Can't follow suit: Ruff with smallest trump if non-trump lead
-        if lead_suit != trump:
-            trumps = [c for c in allowed_sorted if c[0] == trump]
-            if trumps:
-                return trumps[0]
-
-        # Discard lowest value card
-        return allowed_sorted[0]
-
+        _S["pending"] = (tid, card, view.face_up_card, view.phase)
 
 # ---------------------------------------------------------------------------
-# Main Bot Entry Point
+# Heuristics & Evaluations
 # ---------------------------------------------------------------------------
-def nextMove(view):
-    MEMORY.sync(view)
+def _suit_summaries():
+    out = []
+    for p in _S["particles"]:
+        d = {}
+        for s, r in p:
+            if s in d:
+                cnt, mx, mn = d[s]
+                d[s] = (cnt + 1, max(mx, r), min(mn, r))
+            else:
+                d[s] = (1, r, r)
+        out.append(d)
+    return out
 
+def _discard_value(card, hand, trump, opp_max=None):
+    s, r = card
+    val = _v(card, trump)
+    if s == trump:
+        return val + TRUMP_CLING
+    ranks = [x[1] for x in hand if x[0] == s]
+    hi = max(ranks)
+    sc = val + DUMP_LEN_W * min(len(ranks), 5)
+    if hi == 13 and len(ranks) == 2 and r < hi:
+        sc += GUARD_K
+    if hi == 12 and len(ranks) <= 3 and r < hi:
+        sc += GUARD_Q
+    if opp_max is not None and r > opp_max.get(s, 0):
+        sc += MASTER_KEEP
+    return sc
+
+def _best_discard(cards, hand, trump, opp_max=None):
+    return min(cards, key=lambda c: _discard_value(c, hand, trump, opp_max))
+
+def _phase1_follow(view):
     hand = view.your_hand
     trump = view.trump_suit
+    lead_card = view.current_trick[0][1]
+    ls, lr = lead_card
 
-    lead_card = None
-    if view.current_trick and view.current_trick[0][0] != view.your_name:
-        lead_card = view.current_trick[0][1]
+    fu = view.face_up_card
+    delta = _v(fu, trump) - 25.0 if fu else 0.0
 
-    allowed = legal_cards(hand, lead_card)
+    same = [c for c in hand if c[0] == ls]
+    if same:
+        duck = min(same, key=lambda c: c[1])
+        winners = [c for c in same if c[1] > lr]
+        if winners:
+            w = min(winners, key=lambda c: c[1])
+            if 2.0 * delta > _v(w, trump) - _v(duck, trump) + P1_FOLLOW_MARGIN:
+                return w
+        return duck
 
-    # =========================================================================
-    # PHASE 1: RECRUITMENT PHASE
-    # =========================================================================
-    if view.phase == 1:
-        prize = view.face_up_card
+    dump = _best_discard(list(hand), hand, trump)
+    if ls != trump:
+        trumps = [c for c in hand if c[0] == trump]
+        if trumps:
+            w = min(trumps, key=lambda c: c[1])
+            if 2.0 * delta > _v(w, trump) - _v(dump, trump) + P1_FOLLOW_MARGIN:
+                return w
+    return dump
 
-        # Prize Valuation: Fight for Trumps, Aces, Kings, Queens
-        is_good_prize = False
-        if prize:
-            p_suit, p_rank = prize
-            is_good_prize = (p_suit == trump) or (p_rank >= 12)
+def _phase1_lead(view):
+    hand = view.your_hand
+    trump = view.trump_suit
+    dump = _best_discard(list(hand), hand, trump)
+    fu = view.face_up_card
+    if not fu:
+        return dump
 
-        # Sort moves: non-trumps low->high, then trumps low->high
-        sorted_allowed = sorted(allowed, key=lambda c: (1 if c[0] == trump else 0, c[1]))
+    val = _v(fu, trump)
+    if val > 20.0:
+        trumps = [c for c in hand if c[0] == trump]
+        if trumps:
+            return max(trumps, key=lambda c: c[1])
+        masters = [c for c in hand if c[1] >= 13]
+        if masters:
+            return max(masters, key=lambda c: c[1])
+    return dump
 
-        if lead_card is None:
-            # LEADING
-            if is_good_prize:
-                return sorted_allowed[-1]  # Play top card to secure prize
-            else:
-                # Shed lowest non-trump card to give away bad prize
-                non_trumps = [c for c in sorted_allowed if c[0] != trump]
-                return non_trumps[0] if non_trumps else sorted_allowed[0]
-        else:
-            # FOLLOWING
-            lead_suit = lead_card[0]
-            can_follow = (allowed[0][0] == lead_suit)
+def _phase2_lead(view):
+    hand = view.your_hand
+    trump = view.trump_suit
+    summaries = _suit_summaries()
 
-            if is_good_prize:
-                if can_follow:
-                    winners = [c for c in sorted_allowed if c[1] > lead_card[1]]
-                    if winners:
-                        return winners[0]
-                elif trump in [c[0] for c in allowed]:
-                    trumps = [c for c in sorted_allowed if c[0] == trump]
-                    return trumps[0]
-                
-                return sorted_allowed[0]
-            else:
-                # Yield trick to take unseen card instead
-                return sorted_allowed[0]
+    # Cash high masters
+    for c in sorted(hand, key=lambda x: x[1], reverse=True):
+        if c[0] != trump and c[1] == 14:
+            return c
 
-    # =========================================================================
-    # PHASE 2: SCORING PHASE
-    # =========================================================================
+    exits = [c for c in hand if c[0] != trump] or list(hand)
+    return min(exits, key=lambda c: _discard_value(c, hand, trump))
+
+def _phase2_follow(view):
+    hand = view.your_hand
+    trump = view.trump_suit
+    lead_card = view.current_trick[0][1]
+    ls, lr = lead_card
+
+    same = [c for c in hand if c[0] == ls]
+    if same:
+        winners = [c for c in same if c[1] > lr]
+        return min(winners, key=lambda c: c[1]) if winners else min(same, key=lambda c: c[1])
+
+    if ls != trump:
+        trumps = [c for c in hand if c[0] == trump]
+        if trumps:
+            return min(trumps, key=lambda c: c[1])
+
+    return _best_discard(list(hand), hand, trump)
+
+# ---------------------------------------------------------------------------
+# Alpha-Beta Accelerated Endgame Solver
+# ---------------------------------------------------------------------------
+def _solve_ab(my, opp, i_lead, trump, memo, alpha, beta):
+    if not my:
+        return 0
+    key = (my, opp, i_lead)
+    if key in memo:
+        return memo[key]
+
+    if i_lead:
+        value = -1
+        for c in sorted(my, key=lambda x: x[1], reverse=True):
+            rest_my = tuple(x for x in my if x != c)
+            same = [o for o in opp if o[0] == c[0]]
+            replies = same if same else list(opp)
+
+            worst = 99
+            for o in sorted(replies, key=lambda x: x[1]):
+                rest_opp = tuple(x for x in opp if x != o)
+                i_win = not _beats(c, o, trump)
+                val = (1 if i_win else 0) + _solve_ab(rest_my, rest_opp, i_win, trump, memo, alpha, beta)
+                if val < worst:
+                    worst = val
+                if worst <= alpha:
+                    break
+            if worst > value:
+                value = worst
+            if value >= beta:
+                break
+            alpha = max(alpha, value)
     else:
-        opp_hand = MEMORY.deduce_opponent_hand(hand)
-        return solve_phase2_move(hand, opp_hand, trump, lead_card)
+        value = 99
+        for o in sorted(opp, key=lambda x: x[1], reverse=True):
+            rest_opp = tuple(x for x in opp if x != o)
+            same = [c for c in my if c[0] == o[0]]
+            replies = same if same else list(my)
+
+            best = -1
+            for c in sorted(replies, key=lambda x: x[1]):
+                rest_my = tuple(x for x in my if x != c)
+                i_win = _beats(o, c, trump)
+                val = (1 if i_win else 0) + _solve_ab(rest_my, rest_opp, i_win, trump, memo, alpha, beta)
+                if val > best:
+                    best = val
+                if best >= beta:
+                    break
+            if best < value:
+                value = best
+            if value <= alpha:
+                break
+            beta = min(beta, value)
+
+    memo[key] = value
+    return value
+
+def _endgame_move(view):
+    hand = view.your_hand
+    trump = view.trump_suit
+    t0 = time.time()
+
+    if view.current_trick:
+        lead_card = view.current_trick[0][1]
+        same = [c for c in hand if c[0] == lead_card[0]]
+        legal = same if same else list(hand)
+    else:
+        lead_card = None
+        legal = list(hand)
+
+    if len(legal) == 1:
+        return legal[0]
+
+    size = _opp_size(view)
+    parts = [p for p in _S["particles"] if len(p) == size]
+    if not parts:
+        return None
+
+    samples = [tuple(sorted(p)) for p in random.sample(parts, min(len(parts), EG_SAMPLES))]
+    scores = {c: 0 for c in legal}
+
+    for opp in samples:
+        memo = {}
+        for c in legal:
+            rest_my = tuple(sorted(x for x in hand if x != c))
+            if lead_card is None:
+                same_o = [o for o in opp if o[0] == c[0]]
+                replies = same_o if same_o else list(opp)
+                worst = 99
+                for o in replies:
+                    rest_opp = tuple(x for x in opp if x != o)
+                    i_win = not _beats(c, o, trump)
+                    val = (1 if i_win else 0) + _solve_ab(rest_my, rest_opp, i_win, trump, memo, -1, 99)
+                    worst = min(worst, val)
+                scores[c] += worst
+            else:
+                i_win = _beats(lead_card, c, trump)
+                val = (1 if i_win else 0) + _solve_ab(rest_my, tuple(sorted(opp)), i_win, trump, memo, -1, 99)
+                scores[c] += val
+
+        if time.time() - t0 > EG_TIME:
+            break
+
+    return max(legal, key=lambda c: scores[c])
+
+# ---------------------------------------------------------------------------
+# Main Hook & Safety Fallbacks
+# ---------------------------------------------------------------------------
+def _safe_move(view):
+    try:
+        hand = view.your_hand
+        if view.current_trick:
+            ls = view.current_trick[0][1][0]
+            same = [c for c in hand if c[0] == ls]
+            if same:
+                return min(same, key=lambda c: c[1])
+            return min(hand, key=lambda c: c[1])
+    except Exception:
+        pass
+    return view.your_hand[0]
+
+def _legal_ok(view, card):
+    if card is None or card not in view.your_hand:
+        return False
+    if view.current_trick:
+        ls = view.current_trick[0][1][0]
+        if card[0] != ls and any(c[0] == ls for c in view.your_hand):
+            return False
+    return True
+
+def _move(view):
+    tid = _update(view)
+
+    if view.phase == 1:
+        card = _phase1_follow(view) if view.current_trick else _phase1_lead(view)
+    else:
+        card = None
+        if len(view.your_hand) <= EG_HAND:
+            card = _endgame_move(view)
+        if card is None or not _legal_ok(view, card):
+            card = _phase2_follow(view) if view.current_trick else _phase2_lead(view)
+
+    if not _legal_ok(view, card):
+        card = _safe_move(view)
+    _after_move(view, card, tid)
+    return card
+
+def nextMove(gameState):
+    try:
+        return _move(gameState)
+    except Exception:
+        return _safe_move(gameState)
