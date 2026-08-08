@@ -1,228 +1,211 @@
-# Apex Spades Player
-# Max Effort implementation. Features absolute card counting, void tracking, 
-# boss-card calculation, and bag-aware play.
+import math
+
 
 def nextMove(gameState):
-    """
-    Tournament entry point wrapped in a failsafe to guarantee sub-second execution
-    and zero forfeits[cite: 2, 4].
-    """
     try:
         if gameState.phase == "bid":
-            return _calculate_apex_bid(gameState)
-        return _play_apex_card(gameState)
-    except Exception as e:
-        # Failsafe: return the absolute simplest legal move to prevent a forfeit crash[cite: 2].
+            return _choose_bid(gameState)
+        return _play_card(gameState)
+    except Exception:
         if gameState.phase == "bid":
-            return max(1, sum(1 for c in gameState.your_hand if c[1] >= 11))
-        return _fallback_legal_card(gameState)
+            return 1
+        return _fallback(gameState)
 
 
 # ---------------------------------------------------------------------------
-# Advanced Bidding: Bag-Aware & Voids
+# Bidding
 # ---------------------------------------------------------------------------
-def _calculate_apex_bid(gs):
+
+def _suit_ranks(suit):
+    return range(2, 15) if suit in ("S", "H") else range(3, 15)
+
+
+def _p_opponent_has_none(higher_count, unseen, opp_size):
+    """Probability none of *higher_count* specific unseen cards are in the
+    opponent's *opp_size*-card hand, given *unseen* total unseen cards.
+
+    The kitty (24 cards) never gets played, so only ~1/3 of unseen cards are
+    ever actually in the opponent's hand — most "dangerous" higher cards
+    never show up. That's why decent (not just top) cards win tricks here.
     """
-    Calculates bid based on raw strength, short suits, and exact bag proximity.
-    """
-    hand = gs.your_hand
-    bags = gs.your_bags  #
-    
-    bid = 0.0
-    s_ranks, h_ranks, d_ranks, c_ranks = [], [], [], []
+    if higher_count <= 0:
+        return 1.0
+    if higher_count > unseen - opp_size:
+        return 0.0
+    return math.comb(unseen - higher_count, opp_size) / math.comb(unseen, opp_size)
+
+
+def _estimate_tricks(hand):
+    unseen = 50 - len(hand)
+    opp_size = 13
+
+    by_suit = {"S": [], "H": [], "D": [], "C": []}
     for suit, rank in hand:
-        if suit == 'S': s_ranks.append(rank)
-        elif suit == 'H': h_ranks.append(rank)
-        elif suit == 'D': d_ranks.append(rank)
-        elif suit == 'C': c_ranks.append(rank)
-        
-    # Evaluate Spades
-    for r in s_ranks:
-        if r >= 11: bid += 1
-    if len(s_ranks) > 3:
-        bid += (len(s_ranks) - 3)
-        
-    # Evaluate Off-suits
-    for ranks in (h_ranks, d_ranks, c_ranks):
-        if 14 in ranks: bid += 1
-        if 13 in ranks:
-            bid += 0.8 if (len(ranks) >= 2 or s_ranks) else 0.4
-        if 12 in ranks and len(ranks) >= 3:
-            bid += 0.5
-            
-    # Short Suit Bonus (Ability to trump)
-    if s_ranks:
-        for ranks in (h_ranks, d_ranks, c_ranks):
-            if len(ranks) == 0: bid += 1
-            elif len(ranks) == 1: bid += 0.5
-            
-    final_bid = int(round(bid))
-    
-    # Bag penalty avoidance: If we are at 8 or 9 bags, DO NOT underbid. 
-    # We round UP aggressively to avoid accidentally taking overtricks.
-    if bags >= 8 and final_bid < 13:
-        if (bid % 1) > 0.1: # Even slightly over, push the bid up to cap bags
-            final_bid += 1
-            
-    # Safe Nil Validation[cite: 5]
-    if final_bid == 0:
-        for s, r in hand:
-            if r > 10 or (s == 'S' and r > 9):
-                return 1
+        by_suit[suit].append(rank)
+
+    spade_count = len(by_suit["S"])
+    est = 0.0
+
+    for suit, ranks in by_suit.items():
+        for r in ranks:
+            higher_outside = sum(1 for x in _suit_ranks(suit) if x > r and x not in ranks)
+            p_clear = _p_opponent_has_none(higher_outside, unseen, opp_size)
+            if suit == "S":
+                est += p_clear
+            else:
+                # Even if no higher card of the suit exists in their hand,
+                # a void opponent can still trump it — small discount.
+                trump_risk = 0.12 if spade_count else 0.0
+                est += p_clear * (1 - trump_risk)
+
+        if suit != "S" and spade_count:
+            if not ranks:
+                est += 0.5  # void: likely to get a ruff in eventually
+            elif len(ranks) == 1:
+                est += 0.25  # singleton: probably ruffable after one round
+
+    # Calibration: "no higher card in the opponent's hand" per card understates
+    # real trick counts, because the two hands are dealt symmetrically from the
+    # same pool, so average tricks across a hand must converge to 6.5 (half of
+    # 13), not the ~3.4 the raw per-card sum produces. Scale to match reality.
+    return est * 1.9
+
+
+def _nil_safe(hand):
+    est = _estimate_tricks(hand)
+    spade_count = sum(1 for s, _ in hand if s == "S")
+    return est <= 1.7 and spade_count <= 5
+
+
+def _choose_bid(gs):
+    hand = gs.your_hand
+    est = _estimate_tricks(hand)
+
+    if est <= 2.8 and _nil_safe(hand):
         return 0
-        
-    return min(13, max(1, final_bid))
+
+    # Missing a bid costs bid*10; an overtrick only costs 1 point (plus a
+    # bag). Bidding at the raw expectation misses ~50% of the time, so shade
+    # the bid below the expected trick count to trade a few cheap overtricks
+    # for far fewer expensive misses.
+    bid = max(1, min(13, int(round(est - 1.6))))
+
+    # Close to the bag penalty: round up rather than risk overtricks.
+    if gs.your_bags >= 8 and bid < 13 and (est - int(est)) > 0.15:
+        bid += 1
+
+    return bid
 
 
 # ---------------------------------------------------------------------------
-# Apex Play Engine (Card Counting)
+# Play
 # ---------------------------------------------------------------------------
-def _play_apex_card(gs):
-    """
-    Dominates play by tracking exactly which cards have been played, 
-    detecting opponent voids, and forcing optimal trades[cite: 1, 4].
-    """
+
+def _legal_moves(hand, trick, spades_broken):
+    if not trick:
+        non_spades = [c for c in hand if c[0] != "S"]
+        if not non_spades or spades_broken:
+            return list(hand)
+        return non_spades
+    lead_suit = trick[0][1][0]
+    same_suit = [c for c in hand if c[0] == lead_suit]
+    return same_suit if same_suit else list(hand)
+
+
+def _beats(lead, candidate):
+    ls, lr = lead
+    cs, cr = candidate
+    if cs == "S" and ls != "S":
+        return True
+    if ls == "S":
+        return cs == "S" and cr > lr
+    if cs == ls:
+        return cr > lr
+    return False
+
+
+def _card_value(card):
+    suit, rank = card
+    return rank + (20 if suit == "S" else 0)
+
+
+def _play_card(gs):
     hand = gs.your_hand
     trick = gs.current_trick
-    spades_broken = gs.spades_broken
-    
-    # 1. State Reconstruction (Card Counting)
-    played_cards = set()
-    opp_voids = {'H': False, 'D': False, 'C': False, 'S': False}
-    
-    # Analyze trick history to track voids[cite: 4]
-    for t in gs.trick_history:
-        plays = t["plays"]
-        leader, lead_card = plays[0]
-        follower, follow_card = plays[1]
-        
-        played_cards.add(lead_card)
-        played_cards.add(follow_card)
-        
-        # If follower didn't match lead suit, they are void in it[cite: 5]
-        if follow_card[0] != lead_card[0]:
-            if follower == gs.opponent_name:
-                opp_voids[lead_card[0]] = True
-                
-    if trick:
-        played_cards.add(trick[0][1])
-
-    # 2. Get Legal Moves[cite: 1]
-    legal = []
-    if not trick:
-        if spades_broken:
-            legal = hand
-        else:
-            legal = [c for c in hand if c[0] != 'S'] or hand
-    else:
-        lead_suit = trick[0][1][0]
-        legal = [c for c in hand if c[0] == lead_suit] or hand
-        
+    legal = _legal_moves(hand, trick, gs.spades_broken)
     if len(legal) == 1:
         return legal[0]
 
-    # 3. Define Motivations
-    my_bid = gs.your_bid
-    my_tricks = gs.tricks_won.get(gs.your_name, 0)
-    need_tricks = (my_tricks < my_bid)
-    
-    opp_bid = gs.opponent_bid
-    opp_tricks = gs.tricks_won.get(gs.opponent_name, 0)
-    bust_nil = (opp_bid == 0 and opp_tricks == 0)
-    
-    if bust_nil:
-        need_tricks = False
+    played = set()
+    opp_voids = set()
+    for t in gs.trick_history:
+        (leader, lead_card), (follower, follow_card) = t["plays"]
+        played.add(lead_card)
+        played.add(follow_card)
+        if follow_card[0] != lead_card[0] and follower == gs.opponent_name:
+            opp_voids.add(lead_card[0])
+    if trick:
+        played.add(trick[0][1])
 
-    # 4. Helper to find "Boss" cards (highest unplayed card in a suit)
-    def is_boss(card):
-        s, r = card
-        for rank in range(r + 1, 15):
-            if (s, rank) not in played_cards and (s, rank) not in hand:
-                return False
-        return True
+    need_tricks = gs.tricks_won.get(gs.your_name, 0) < gs.your_bid
 
-    # -----------------------------------------------------------
-    # LEADING PHASE
-    # -----------------------------------------------------------
+    def outstanding(suit):
+        return [r for r in range(2, 15) if (suit, r) not in played and (suit, r) not in hand]
+
+    spades_gone = not outstanding("S")
+
+    def is_safe_boss(card):
+        suit, rank = card
+        if any(r > rank for r in outstanding(suit)):
+            return False
+        return suit == "S" or "S" in opp_voids or spades_gone
+
     if not trick:
-        if need_tricks:
-            # Play a guaranteed winner (Boss card) if we have one
-            for c in sorted(legal, key=lambda x: x[1], reverse=True):
-                # Only lead boss non-spades if opponent isn't void, or boss spades
-                if is_boss(c):
-                    if c[0] == 'S' or not opp_voids[c[0]]:
-                        return c
-            # Fallback: Bleed their high cards by leading our highest off-suit
-            non_spades = [c for c in legal if c[0] != 'S']
-            if non_spades: return max(non_spades, key=lambda x: x[1])
-            return max(legal, key=lambda x: x[1])
-            
-        else:
-            # We want to LOSE (Evasion / Bust Nil)
-            # Find the absolute lowest card in a suit the opponent is NOT void in.
-            safe_losers = [c for c in legal if not opp_voids[c[0]]]
-            if safe_losers:
-                # Prefer leading off-suits over spades to dodge tricks safely
-                non_spades = [c for c in safe_losers if c[0] != 'S']
-                if non_spades: return min(non_spades, key=lambda x: x[1])
-                return min(safe_losers, key=lambda x: x[1])
-                
-            # If forced to lead a suit they ARE void in, lead our HIGHEST card. 
-            # They will trump it, taking the trick and stripping our high cards.
-            void_suits = [c for c in legal if opp_voids[c[0]]]
-            if void_suits:
-                return max(void_suits, key=lambda x: x[1])
-                
-            return min(legal, key=lambda x: x[1])
+        return _lead(legal, need_tricks, opp_voids, is_safe_boss)
 
-    # -----------------------------------------------------------
-    # FOLLOWING PHASE
-    # -----------------------------------------------------------
     lead_card = trick[0][1]
-    
-    winners = []
-    losers = []
-    for c in legal:
-        if _wins_trick(lead_card, c): winners.append(c)
-        else: losers.append(c)
-        
+    return _follow(legal, lead_card, need_tricks)
+
+
+def _lead(legal, need_tricks, opp_voids, is_safe_boss):
+    if need_tricks:
+        bosses = [c for c in legal if is_safe_boss(c)]
+        if bosses:
+            return max(bosses, key=lambda c: c[1])
+        pool = [c for c in legal if c[0] != "S"] or legal
+        return max(pool, key=lambda c: c[1])
+
+    # Trying to lose this trick: lead low in a suit the opponent can follow,
+    # since a suit they're void in lets them trump us for free.
+    safe = [c for c in legal if c[0] not in opp_voids]
+    if safe:
+        pool = [c for c in safe if c[0] != "S"] or safe
+        return min(pool, key=lambda c: c[1])
+    return max(legal, key=_card_value)
+
+
+def _follow(legal, lead_card, need_tricks):
+    winners = [c for c in legal if _beats(lead_card, c)]
+    losers = [c for c in legal if c not in winners]
+
     if need_tricks:
         if winners:
-            # Win as cheaply as possible
-            return min(winners, key=lambda x: x[1] if x[0] != 'S' else x[1] + 20)
-        else:
-            # Throw away the absolute cheapest card
-            return min(losers, key=lambda x: x[1] if x[0] != 'S' else x[1] + 20)
-            
-    else: # We want to LOSE
-        if losers:
-            # Safely dump our HIGHEST losing card.
-            return max(losers, key=lambda x: x[1] if x[0] != 'S' else x[1] + 20)
-        else:
-            # Forced to win: Dump the HIGHEST winning card so it can't accidentally win later.
-            return max(winners, key=lambda x: x[1] if x[0] != 'S' else x[1] + 20)
+            return min(winners, key=_card_value)
+        return min(losers, key=_card_value)
+
+    if losers:
+        return max(losers, key=_card_value)
+    return max(winners, key=_card_value)  # forced to win: shed the priciest card
 
 
-# ---------------------------------------------------------------------------
-# Base Helpers
-# ---------------------------------------------------------------------------
-def _wins_trick(lead_card, follow_card):
-    """Engine trick resolution mapping[cite: 1, 5]."""
-    ls, lr = lead_card
-    fs, fr = follow_card
-    if ls == 'S' or fs == 'S':
-        if ls == 'S' and fs == 'S': return fr > lr
-        return fs == 'S'
-    return fs == ls and fr > lr
-
-
-def _fallback_legal_card(gs):
-    """Ultimate failsafe legal move generator[cite: 3]."""
+def _fallback(gs):
     hand, trick = gs.your_hand, gs.current_trick
     if trick:
         same = [c for c in hand if c[0] == trick[0][1][0]]
-        if same: return same[0]
+        if same:
+            return same[0]
     if not gs.spades_broken:
-        ns = [c for c in hand if c[0] != 'S']
-        if ns: return ns[0]
+        non_spades = [c for c in hand if c[0] != "S"]
+        if non_spades:
+            return non_spades[0]
     return hand[0]
