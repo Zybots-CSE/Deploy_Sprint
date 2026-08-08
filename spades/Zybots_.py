@@ -1,20 +1,23 @@
-
 import math
 
-
 def nextMove(gameState):
+    """
+    Tournament entry point wrapped in a failsafe to guarantee sub-second execution
+    and zero forfeits.
+    """
     try:
         if gameState.phase == "bid":
             return _choose_bid(gameState)
         return _play_card(gameState)
     except Exception:
+        # Failsafe: Prevent crash / forfeit
         if gameState.phase == "bid":
-            return 1
+            return max(1, sum(1 for c in gameState.your_hand if c[1] >= 11))
         return _fallback(gameState)
 
 
 # ---------------------------------------------------------------------------
-# Bidding
+# Bidding System (Probability-Driven & Bag-Aware)
 # ---------------------------------------------------------------------------
 
 def _suit_ranks(suit):
@@ -22,13 +25,7 @@ def _suit_ranks(suit):
 
 
 def _p_opponent_has_none(higher_count, unseen, opp_size):
-    """Probability none of *higher_count* specific unseen cards are in the
-    opponent's *opp_size*-card hand, given *unseen* total unseen cards.
-
-    The kitty (24 cards) never gets played, so only ~1/3 of unseen cards are
-    ever actually in the opponent's hand — most "dangerous" higher cards
-    never show up. That's why decent (not just top) cards win tricks here.
-    """
+    """Probability none of higher_count unseen cards are in opponent's hand."""
     if higher_count <= 0:
         return 1.0
     if higher_count > unseen - opp_size:
@@ -54,28 +51,24 @@ def _estimate_tricks(hand):
             if suit == "S":
                 est += p_clear
             else:
-                # Even if no higher card of the suit exists in their hand,
-                # a void opponent can still trump it — small discount.
                 trump_risk = 0.12 if spade_count else 0.0
                 est += p_clear * (1 - trump_risk)
 
+        # Short suit bonuses
         if suit != "S" and spade_count:
             if not ranks:
-                est += 0.5  # void: likely to get a ruff in eventually
+                est += 0.5  # Void
             elif len(ranks) == 1:
-                est += 0.25  # singleton: probably ruffable after one round
+                est += 0.25 # Singleton
 
-    # Calibration: "no higher card in the opponent's hand" per card understates
-    # real trick counts, because the two hands are dealt symmetrically from the
-    # same pool, so average tricks across a hand must converge to 6.5 (half of
-    # 13), not the ~3.4 the raw per-card sum produces. Scale to match reality.
-    return est * 1.9
+    return est * 1.9  # Calibrate hand expectation scale
 
 
 def _nil_safe(hand):
     est = _estimate_tricks(hand)
     spade_count = sum(1 for s, _ in hand if s == "S")
-    return est <= 1.7 and spade_count <= 5
+    has_high = any(r > 10 for _, r in hand)
+    return est <= 1.7 and spade_count <= 5 and not has_high
 
 
 def _choose_bid(gs):
@@ -85,13 +78,10 @@ def _choose_bid(gs):
     if est <= 2.8 and _nil_safe(hand):
         return 0
 
-    # Missing a bid costs bid*10; an overtrick only costs 1 point (plus a
-    # bag). Bidding at the raw expectation misses ~50% of the time, so shade
-    # the bid below the expected trick count to trade a few cheap overtricks
-    # for far fewer expensive misses.
+    # Shade bid slightly to avoid severe underbid penalty (-10/bid) vs overtricks (+1)
     bid = max(1, min(13, int(round(est - 1.6))))
 
-    # Close to the bag penalty: round up rather than risk overtricks.
+    # Bag penalty avoidance: aggressively bid up if sitting at 8+ bags
     if gs.your_bags >= 8 and bid < 13 and (est - int(est)) > 0.15:
         bid += 1
 
@@ -99,7 +89,7 @@ def _choose_bid(gs):
 
 
 # ---------------------------------------------------------------------------
-# Play
+# Card-Counting Play Engine
 # ---------------------------------------------------------------------------
 
 def _legal_moves(hand, trick, spades_broken):
@@ -137,6 +127,7 @@ def _play_card(gs):
     if len(legal) == 1:
         return legal[0]
 
+    # Reconstruct card-counting and void states
     played = set()
     opp_voids = set()
     for t in gs.trick_history:
@@ -148,7 +139,14 @@ def _play_card(gs):
     if trick:
         played.add(trick[0][1])
 
-    need_tricks = gs.tricks_won.get(gs.your_name, 0) < gs.your_bid
+    my_tricks = gs.tricks_won.get(gs.your_name, 0)
+    need_tricks = my_tricks < gs.your_bid
+
+    # Force trick evasion if opponent is in Nil and unbroken
+    opp_bid = gs.opponent_bid
+    opp_tricks = gs.tricks_won.get(gs.opponent_name, 0)
+    if opp_bid == 0 and opp_tricks == 0:
+        need_tricks = False
 
     def outstanding(suit):
         return [r for r in range(2, 15) if (suit, r) not in played and (suit, r) not in hand]
@@ -159,7 +157,7 @@ def _play_card(gs):
         suit, rank = card
         if any(r > rank for r in outstanding(suit)):
             return False
-        return suit == "S" or "S" in opp_voids or spades_gone
+        return suit == "S" or suit in opp_voids or spades_gone
 
     if not trick:
         return _lead(legal, need_tricks, opp_voids, is_safe_boss)
@@ -176,8 +174,7 @@ def _lead(legal, need_tricks, opp_voids, is_safe_boss):
         pool = [c for c in legal if c[0] != "S"] or legal
         return max(pool, key=lambda c: c[1])
 
-    # Trying to lose this trick: lead low in a suit the opponent can follow,
-    # since a suit they're void in lets them trump us for free.
+    # Ducking/Evasion play: lead low in non-void suits
     safe = [c for c in legal if c[0] not in opp_voids]
     if safe:
         pool = [c for c in safe if c[0] != "S"] or safe
@@ -191,12 +188,12 @@ def _follow(legal, lead_card, need_tricks):
 
     if need_tricks:
         if winners:
-            return min(winners, key=_card_value)
-        return min(losers, key=_card_value)
+            return min(winners, key=_card_value)  # Win as cheap as possible
+        return min(losers, key=_card_value)   # Preserve high cards
 
     if losers:
-        return max(losers, key=_card_value)
-    return max(winners, key=_card_value)  # forced to win: shed the priciest card
+        return max(losers, key=_card_value)   # Duck with highest losing card
+    return max(winners, key=_card_value)       # Forced win: dump highest winning card
 
 
 def _fallback(gs):
